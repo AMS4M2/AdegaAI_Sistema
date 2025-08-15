@@ -1,0 +1,111 @@
+name: Auto-Apply ZIP to adegaMain
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL pública do pacote .zip com os arquivos atualizados (ex.: https://servidor/adega_updated_files.zip)"
+        required: true
+        type: string
+      commit_message:
+        description: "Mensagem de commit"
+        required: false
+        default: "chore: atualização automática via workflow"
+        type: string
+      create_pr_instead_of_push:
+        description: "Criar Pull Request ao invés de push direto?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: write        # necessário para push
+  pull-requests: write   # necessário para criar PR
+
+jobs:
+  apply-zip:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: adegaMain
+      REPO: ${{ github.repository }}
+
+    steps:
+      - name: Checkout (adegaMain)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Validar entradas
+        run: |
+          if [[ -z "${{ inputs.zip_url }}" ]]; then
+            echo "zip_url é obrigatório"; exit 1
+          fi
+
+      - name: Instalar dependências (unzip/curl)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y unzip curl
+
+      - name: Baixar pacote ZIP
+        run: |
+          echo "Baixando: ${{ inputs.zip_url }}"
+          curl -L --fail -o update.zip "${{ inputs.zip_url }}"
+          ls -lh update.zip
+
+      - name: Criar backup branch
+        id: backup
+        run: |
+          BACKUP="backup-$(date +%Y%m%d-%H%M%S)"
+          echo "BACKUP_BRANCH=${BACKUP}" >> $GITHUB_OUTPUT
+          git checkout -b "$BACKUP"
+          git push -u origin "$BACKUP" || true
+          git checkout "${{ env.TARGET_BRANCH }}"
+          echo "Backup criado: $BACKUP"
+
+      - name: Aplicar pacote no workspace
+        run: |
+          unzip -o update.zip -d "${GITHUB_WORKSPACE}" >/dev/null
+          # reforço para ignorar virtualenv no repositório
+          echo "backend/adegav/" >> .gitignore || true
+          sort -u .gitignore -o .gitignore || true
+
+      - name: Mostrar diff (preview)
+        run: |
+          echo "===== DIFF ====="
+          git status
+          git --no-pager diff --stat
+
+      - name: Commit & Push direto (quando PR desativado)
+        if: ${{ inputs.create_pr_instead_of_push == 'false' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "Nenhuma alteração detectada. Encerrando."
+            exit 0
+          fi
+
+          git add -A
+          git commit -m "${{ inputs.commit_message }}"
+          git push origin "${{ env.TARGET_BRANCH }}"
+
+      - name: Criar Pull Request (quando solicitado)
+        if: ${{ inputs.create_pr_instead_of_push == 'true' }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: ${{ inputs.commit_message }}
+          branch: "auto/apply-zip-${{ github.run_id }}"
+          base: ${{ env.TARGET_BRANCH }}
+          title: "Auto-apply ZIP - ${{ github.run_id }}"
+          body: |
+            Este PR foi criado automaticamente pelo workflow **Auto-Apply ZIP**.
+            - Backup branch: `${{ steps.backup.outputs.BACKUP_BRANCH }}`
+            - ZIP aplicado: `${{ inputs.zip_url }}`
+          labels: |
+            automated
+            zip-apply
